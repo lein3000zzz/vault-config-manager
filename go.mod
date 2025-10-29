@@ -1,4 +1,4 @@
-module vaultConfigManager
+module github.com/lein3000zzz/vault-config-manager
 
 go 1.25
 

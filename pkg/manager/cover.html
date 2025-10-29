@@ -1,0 +1,522 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>manager: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">vaultConfigManager/pkg/manager/vault_secret_manager.go (54.7%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package environment
+
+import (
+        "encoding/json"
+        "errors"
+        "reflect"
+        "strings"
+        "sync"
+        "time"
+
+        vaultapi "github.com/hashicorp/vault/api"
+        "go.uber.org/zap"
+)
+
+const (
+        // DefaultBasePathData - дефолтный путь до самих секретов в папке.
+        DefaultBasePathData = "kv/data/"
+
+        // DefaultBasePathMetaData - дефолтный путь до подпапок с секретами в папке.
+        DefaultBasePathMetaData = "kv/metadata/"
+)
+
+var (
+        // Проверки делать через errors.Is(errToCheck, errToCompareWith)
+
+        ErrKeyNotFound             = errors.New("keyToLookup not found in the config")
+        ErrNotMapInterface         = errors.New("not map interface")
+        ErrWhileConvertingToString = errors.New("error converting folderKeyValues to string")
+        ErrWhileConvertingToBool   = errors.New("error converting folderKeyValues to bool")
+        ErrWhileConvertingToInt    = errors.New("error converting folderKeyValues to int")
+        ErrWhileConvertingToFloat  = errors.New("error converting folderKeyValues to float64")
+        ErrEmptyVaultResponse      = errors.New("empty vault response")
+)
+
+type SecretManagerVault struct {
+        vaultClient *vaultapi.Client
+        config      config
+        logger      *zap.SugaredLogger
+        notifier    chan struct{}
+
+        basePath     string
+        baseMetaPath string
+
+        *sync.RWMutex
+}
+
+func NewSecretManager(
+        vaultAddr,
+        token,
+        basePath string,
+        baseMetaPath string,
+        logger *zap.SugaredLogger,
+) (*SecretManagerVault, error) <span class="cov8" title="1">{
+        vaultConfig := vaultapi.DefaultConfig()
+        if vaultAddr != "" </span><span class="cov8" title="1">{
+                vaultConfig.Address = vaultAddr
+        }</span>
+
+        <span class="cov8" title="1">client, err := vaultapi.NewClient(vaultConfig)
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">if !strings.HasSuffix(basePath, "/") </span><span class="cov0" title="0">{
+                basePath += "/"
+        }</span>
+
+        <span class="cov8" title="1">if !strings.HasSuffix(baseMetaPath, "/") </span><span class="cov0" title="0">{
+                baseMetaPath += "/"
+        }</span>
+
+        <span class="cov8" title="1">client.SetToken(token)
+
+        smConfig := config(make(map[string]any))
+
+        return &amp;SecretManagerVault{
+                vaultClient:  client,
+                config:       smConfig,
+                logger:       logger,
+                notifier:     make(chan struct{}),
+                RWMutex:      &amp;sync.RWMutex{},
+                basePath:     basePath,
+                baseMetaPath: baseMetaPath,
+        }, nil</span>
+}
+
+// UpdateSpecificSecretString обновляет секрет СРАЗУ В ТЕКУЩЕМ КОНФИГЕ и возвращает секрет в виде строки. Начинаем без слэша, в конце - опционально,
+// поскольку мы обращаемся относительно базового пути, который находится в константах BaseDataPath и BaseMetaDataPath
+// пример - UpdateSpecificSecretString("test/", "test")
+func (sm *SecretManagerVault) UpdateSpecificSecretString(folder, key string) (any, error) <span class="cov8" title="1">{
+        vaultResponse, err := sm.vaultClient.Logical().Read(sm.basePath + folder)
+        if err != nil </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error reading secret at folder '%s': %s", folder, err.Error())
+                return "", err
+        }</span>
+
+        <span class="cov8" title="1">if vaultResponse == nil || vaultResponse.Data == nil </span><span class="cov0" title="0">{
+                sm.logger.Infof("Got nil while reading secret at folder '%s': keyToLookup %s", folder, key)
+                return "", ErrEmptyVaultResponse
+        }</span>
+
+        <span class="cov8" title="1">secretData, okConversionToMapInterface := vaultResponse.Data["data"].(map[string]interface{})
+        if !okConversionToMapInterface </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error reading secret at folder '%s': failed to convert to map[string]interface{}", folder)
+                return "", ErrNotMapInterface
+        }</span>
+
+        <span class="cov8" title="1">secretVal := secretData[key]
+
+        sm.putSingleSecretStringIntoTheConfig(key, secretVal)
+
+        return secretVal, nil</span>
+}
+
+// Добавить в конфиг по определенному ключу определенное значение
+func (sm *SecretManagerVault) putSingleSecretStringIntoTheConfig(key string, secretString any) <span class="cov8" title="1">{
+        sm.Lock()
+        defer sm.Unlock()
+
+        sm.config[key] = secretString
+        sm.logger.Infof("Updated secret in the config with keyToLookup %s to data '%s'", key, secretString)
+}</span>
+
+// UpdateConfig берет полный конфиг из vault'a, и обновления вносит в текущий
+func (sm *SecretManagerVault) UpdateConfig() error <span class="cov0" title="0">{
+        cfg, err := sm.getFullConfigFromVault()
+        if err != nil </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+                return err
+        }</span>
+
+        <span class="cov0" title="0">sm.applyUpdatesToConfig(cfg)
+
+        return nil</span>
+}
+
+// ResetConfig берет полный конфиг из vault'a и старый конфиг заменяет на новый
+func (sm *SecretManagerVault) ResetConfig() error <span class="cov8" title="1">{
+        cfg, err := sm.getFullConfigFromVault()
+        if err != nil </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+                return err
+        }</span>
+
+        <span class="cov8" title="1">sm.setConfig(cfg)
+
+        return nil</span>
+}
+
+// Сетит предоставленный конфиг
+func (sm *SecretManagerVault) setConfig(cfg config) <span class="cov8" title="1">{
+        sm.Lock()
+        defer sm.Unlock()
+
+        sm.logger.Infow("setting new config", "new config", cfg)
+        sm.config = cfg
+}</span>
+
+// getFullConfigFromVault целиком собирает конфиг, проходясь по каждой папке, и считывает секреты с помощью getConfigFromVaultByPath,
+// то есть сохраняются все те же правила - если в папке произошла ошибка, никакие данные из этой папки не будут обновлены.
+// СБОР ВСЕГО КОНФИГА НЕ БЛОКИРУЕТСЯ НИ НА КАКОЙ СТАДИИ, ТО ЕСТЬ У НАС ПРОВЕРЯТСЯ ВСЕ ПАПКИ, ДАЖЕ ЕСЛИ ВО ВРЕМЯ
+// ВЫПОЛНЕНИЯ БУДУТ ОШИБКИ. На выходе мы получаем СОВОКУПНУЮ ошибку, состоящую из нескольких ошибок.
+// Дальнейшие действия зависят от более высокой абстракции
+func (sm *SecretManagerVault) getFullConfigFromVault() (config, error) <span class="cov8" title="1">{
+        folderStack := make([]string, 0, 4)
+        folderStack = append(folderStack, "") // мы смотрим на базовый путь
+
+        cumulativeConfig := config(make(map[string]any))
+
+        var errToReturn error = nil
+        var currCheckedFolder string
+
+        for len(folderStack) &gt; 0 </span><span class="cov8" title="1">{
+                currCheckedFolder = folderStack[len(folderStack)-1]
+                currCheckedPath := sm.baseMetaPath + currCheckedFolder
+                folderStack = folderStack[:len(folderStack)-1]
+
+                vaultResponseList, errList := sm.vaultClient.Logical().List(currCheckedPath)
+
+                if errList != nil </span><span class="cov0" title="0">{
+                        sm.logger.Errorf("Error listing secrets folders at path '%s': %s", currCheckedPath, errList.Error())
+                        errToReturn = errors.Join(errToReturn, errList)
+                        continue</span>
+                }
+
+                <span class="cov8" title="1">if vaultResponseList == nil || vaultResponseList.Data == nil </span><span class="cov8" title="1">{
+                        sm.logger.Infof("Got nil while listing secrets folders at path '%s'", currCheckedPath)
+                        continue</span>
+                }
+
+                <span class="cov8" title="1">var currInnerFolder string
+                for _, folder := range vaultResponseList.Data["keys"].([]interface{}) </span><span class="cov8" title="1">{
+                        folderString, okConversionToString := folder.(string)
+
+                        if !okConversionToString </span><span class="cov0" title="0">{
+                                sm.logger.Errorf("Error reading secret at folder '%s': failed to convert folder to string %s", folder, folderString)
+                                errToReturn = errors.Join(errToReturn, ErrWhileConvertingToString)
+                                continue</span>
+                        }
+
+                        <span class="cov8" title="1">currInnerFolder = currCheckedFolder + folderString
+                        folderConfigUpdates, err := sm.getConfigFromVaultByPath(currInnerFolder)
+                        if err != nil &amp;&amp; !errors.Is(err, ErrEmptyVaultResponse) </span><span class="cov0" title="0">{
+                                errToReturn = errors.Join(errToReturn, err)
+                        }</span>
+
+                        <span class="cov8" title="1">mergeConfigs(cumulativeConfig, folderConfigUpdates)
+
+                        folderStack = append(folderStack, currInnerFolder)</span>
+                }
+        }
+
+        <span class="cov8" title="1">return cumulativeConfig, errToReturn</span>
+}
+
+// UpdateConfigByPath Собирает обновления по пути, а далее вносит обновления в текущий конфиг
+func (sm *SecretManagerVault) UpdateConfigByPath(path string) error <span class="cov8" title="1">{
+        cfg, err := sm.getConfigFromVaultByPath(path)
+        if err != nil </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+                return err
+        }</span>
+
+        <span class="cov8" title="1">sm.applyUpdatesToConfig(cfg)
+
+        return nil</span>
+}
+
+// getConfigFromVaultByPath собирает конфиг по пути, который укажем, относительно базового пути. Если во время обновления произошла
+// хотя бы одна ошибка, изменения останавливаются, и возвращается тот конфиг, который был на момент ошибки.
+// Оставил глобальной для юзкейсов, когда мы точно ничего не удалили, а лишь обновили старые или добавили новые
+func (sm *SecretManagerVault) getConfigFromVaultByPath(path string) (config, error) <span class="cov8" title="1">{
+        vaultResponse, err := sm.vaultClient.Logical().Read(sm.basePath + path)
+
+        freshConfigByPath := config(make(map[string]any))
+
+        if err != nil </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error reading secrets at path '%s': %s", path, err.Error())
+                return freshConfigByPath, err
+        }</span>
+
+        <span class="cov8" title="1">if vaultResponse == nil || vaultResponse.Data == nil </span><span class="cov8" title="1">{
+                return freshConfigByPath, ErrEmptyVaultResponse
+        }</span>
+
+        <span class="cov8" title="1">secretData, okConversionToMapInterface := vaultResponse.Data["data"].(map[string]interface{})
+        if !okConversionToMapInterface </span><span class="cov0" title="0">{
+                sm.logger.Errorf("Error reading secrets at path '%s': failed to convert to map[string]interface{}", path)
+                return freshConfigByPath, ErrNotMapInterface
+        }</span>
+
+        <span class="cov8" title="1">for k, v := range secretData </span><span class="cov8" title="1">{
+
+                switch v.(type) </span>{
+                case json.Number:<span class="cov0" title="0">
+                        freshConfigByPath[k], err = v.(json.Number).Float64()
+
+                        if err != nil </span><span class="cov0" title="0">{
+                                sm.logger.Errorf("Error reading secret at path '%s': %s", path, err.Error())
+                                return freshConfigByPath, err
+                        }</span>
+                default:<span class="cov8" title="1">
+                        freshConfigByPath[k] = v
+                        sm.logger.Debugf("Reading secret, which is not json.Number at path '%s', type %v", path, reflect.TypeOf(v))</span>
+                }
+        }
+
+        <span class="cov8" title="1">return freshConfigByPath, nil</span>
+}
+
+func (sm *SecretManagerVault) applyUpdatesToConfig(configUpdates config) <span class="cov8" title="1">{
+        sm.Lock()
+        defer sm.Unlock()
+
+        sm.logger.Infow("applying updates to config", "configUpdates", configUpdates)
+        for k, v := range configUpdates </span><span class="cov8" title="1">{
+                sm.config[k] = v
+        }</span>
+}
+
+func (sm *SecretManagerVault) GetSecretStringFromConfig(key string) (string, error) <span class="cov8" title="1">{
+        sm.RLock()
+        defer sm.RUnlock()
+        if value, exists := sm.config[key]; exists </span><span class="cov8" title="1">{
+                valueStr, ok := value.(string)
+
+                if !ok </span><span class="cov0" title="0">{
+                        sm.logger.Errorf("Error reading secret at path '%s': failed to convert to string", key)
+                        return "", ErrWhileConvertingToString
+                }</span>
+
+                <span class="cov8" title="1">return valueStr, nil</span>
+        }
+        <span class="cov8" title="1">return "", ErrKeyNotFound</span>
+}
+
+func (sm *SecretManagerVault) GetSecretBoolFromConfig(key string) (bool, error) <span class="cov8" title="1">{
+        sm.RLock()
+        defer sm.RUnlock()
+        if value, exists := sm.config[key]; exists </span><span class="cov8" title="1">{
+                boolVal, ok := value.(bool)
+                if !ok </span><span class="cov8" title="1">{
+                        sm.logger.Errorf("Error reading secret at path '%s': failed to convert to bool", key)
+                        return false, ErrWhileConvertingToBool
+                }</span>
+                <span class="cov8" title="1">return boolVal, nil</span>
+        }
+        <span class="cov8" title="1">return false, ErrKeyNotFound</span>
+}
+
+func (sm *SecretManagerVault) GetSecretIntFromConfig(key string) (int, error) <span class="cov0" title="0">{
+        sm.RLock()
+        defer sm.RUnlock()
+        if value, exists := sm.config[key]; exists </span><span class="cov0" title="0">{
+
+                var intVal int
+                switch value.(type) </span>{
+                case float64:<span class="cov0" title="0">
+                        intVal = int(value.(float64))</span>
+                case int:<span class="cov0" title="0">
+                        intVal = value.(int)</span>
+                default:<span class="cov0" title="0">
+                        sm.logger.Errorf("Error reading secret for key %s from config: failed to convert to int", key)
+                        return 0, ErrWhileConvertingToInt</span>
+                }
+
+                <span class="cov0" title="0">return intVal, nil</span>
+        }
+        <span class="cov0" title="0">return 0, ErrKeyNotFound</span>
+}
+
+func (sm *SecretManagerVault) GetSecretFloat64FromConfig(key string) (float64, error) <span class="cov0" title="0">{
+        sm.RLock()
+        defer sm.RUnlock()
+        if value, exists := sm.config[key]; exists </span><span class="cov0" title="0">{
+                floatVal, ok := value.(float64)
+                if !ok </span><span class="cov0" title="0">{
+                        sm.logger.Errorf("Error reading secret at path '%s': failed to convert to float64", key)
+                        return 0, ErrWhileConvertingToFloat
+                }</span>
+                <span class="cov0" title="0">return floatVal, nil</span>
+        }
+        <span class="cov0" title="0">return 0, ErrKeyNotFound</span>
+}
+
+func (sm *SecretManagerVault) ReloadConfig() error <span class="cov8" title="1">{
+        sm.PurgeConfig()
+        return sm.ResetConfig()
+}</span>
+
+func (sm *SecretManagerVault) PurgeConfig() <span class="cov8" title="1">{
+        sm.Lock()
+        defer sm.Unlock()
+
+        sm.config = make(map[string]any)
+}</span>
+
+func (sm *SecretManagerVault) getConfigCopy() config <span class="cov0" title="0">{
+        sm.RLock()
+        defer sm.RUnlock()
+
+        configCopy := config{}
+        for k, v := range sm.config </span><span class="cov0" title="0">{
+                configCopy[k] = v
+        }</span>
+
+        <span class="cov0" title="0">return sm.config</span>
+}
+
+func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) <span class="cov0" title="0">{
+        ticker := time.NewTicker(updateInterval)
+        configCopy := sm.getConfigCopy()
+
+        for </span><span class="cov0" title="0">{
+                &lt;-ticker.C
+                freshConfig, err := sm.getFullConfigFromVault()
+
+                if err != nil || freshConfig == nil </span><span class="cov0" title="0">{
+                        sm.logger.Errorw("getFullConfigFromVault failed in configUpdater or freshConfig is nil", "error", err.Error(), "freshConfig", freshConfig)
+                        continue</span>
+                }
+
+                <span class="cov0" title="0">if !areConfigsDifferent(freshConfig, configCopy) </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+
+                <span class="cov0" title="0">sm.setConfig(freshConfig)
+                configCopy = sm.getConfigCopy()
+
+                sm.notifier &lt;- struct{}{}</span>
+        }
+}
+
+func (sm *SecretManagerVault) GetNotifierChannel() &lt;-chan struct{} <span class="cov0" title="0">{
+        return sm.notifier
+}</span>
+
+// mergeConfigs - берет ключи из src и пишет в destination. Если в destination такое уже есть, то не пишет!
+func mergeConfigs(destination, src config) <span class="cov8" title="1">{
+        for k, v := range src </span><span class="cov8" title="1">{
+                if _, ok := destination[k]; !ok </span><span class="cov8" title="1">{
+                        destination[k] = v
+                }</span>
+        }
+}
+
+func areConfigsDifferent(config1, config2 config) bool <span class="cov0" title="0">{
+        if len(config1) != len(config2) </span><span class="cov0" title="0">{
+                return true
+        }</span>
+
+        <span class="cov0" title="0">for k, v1 := range config1 </span><span class="cov0" title="0">{
+                if v2, ok := config2[k]; !ok || !reflect.DeepEqual(v1, v2) </span><span class="cov0" title="0">{
+                        return true
+                }</span>
+        }
+
+        <span class="cov0" title="0">return false</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

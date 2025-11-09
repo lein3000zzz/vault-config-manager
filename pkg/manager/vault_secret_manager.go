@@ -84,7 +84,8 @@ func NewSecretManager(
 	}, nil
 }
 
-func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) error {
+// UnsealVault пытается распечатать хранилище и ФАТАЛИТ, если у него не получается
+func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) {
 	status, err := sm.vaultClient.Sys().SealStatus()
 	if err != nil {
 		sm.logger.Fatalf("Error getting seal status: %v", err)
@@ -107,8 +108,6 @@ func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) error {
 			sm.logger.Fatalf("Failed to unseal Vault")
 		}
 	}
-
-	return nil
 }
 
 // UpdateSpecificSecret обновляет секрет СРАЗУ В ТЕКУЩЕМ КОНФИГЕ и возвращает секрет. Начинаем без слэша, в конце - опционально,

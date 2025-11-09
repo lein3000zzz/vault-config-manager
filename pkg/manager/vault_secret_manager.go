@@ -84,6 +84,33 @@ func NewSecretManager(
 	}, nil
 }
 
+func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) error {
+	status, err := sm.vaultClient.Sys().SealStatus()
+	if err != nil {
+		sm.logger.Fatalf("Error getting seal status: %v", err)
+	}
+
+	if status.Sealed {
+		for _, key := range unsealKeys {
+			resp, err := sm.vaultClient.Sys().Unseal(strings.TrimSpace(key))
+			if err != nil {
+				sm.logger.Fatalf("Error unsealing Vault with key: %v", err)
+			}
+			if !resp.Sealed {
+				sm.logger.Info("Vault unsealed successfully")
+				break
+			}
+		}
+
+		status, err = sm.vaultClient.Sys().SealStatus()
+		if err != nil || status.Sealed {
+			sm.logger.Fatalf("Failed to unseal Vault")
+		}
+	}
+
+	return nil
+}
+
 // UpdateSpecificSecret обновляет секрет СРАЗУ В ТЕКУЩЕМ КОНФИГЕ и возвращает секрет. Начинаем без слэша, в конце - опционально,
 // поскольку мы обращаемся относительно базового пути, который находится в константах BaseDataPath и BaseMetaDataPath
 // пример - UpdateSpecificSecretString("test/", "test")

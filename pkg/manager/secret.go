@@ -23,4 +23,5 @@ type SecretManager interface {
 	GetSecretFloat64FromConfig(key string) (float64, error)
 	StartConfigUpdater(updateInterval time.Duration)
 	GetNotifierChannel() <-chan struct{}
+	UnsealVault(unsealKeys []string)
 }

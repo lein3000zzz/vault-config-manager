@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 	"os"
-	"vaultConfigManager/pkg/manager"
 
+	"github.com/lein3000zzz/vault-config-manager/pkg/manager"
 	"go.uber.org/zap"
 )
 
@@ -25,13 +25,6 @@ func initLogger() *zap.SugaredLogger {
 		log.Fatalf("Error initializing zap logger: %v", err)
 		return nil
 	}
-
-	defer func(zapLogger *zap.Logger) {
-		err := zapLogger.Sync()
-		if err != nil {
-			log.Fatalf("Error syncing zap logger: %v", err)
-		}
-	}(zapLogger)
 
 	logger := zapLogger.Sugar()
 	return logger

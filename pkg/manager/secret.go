@@ -10,7 +10,15 @@ const (
 	DefaultConfigUpdateInterval = 5 * time.Minute
 )
 
+type logger interface {
+	Errorf(format string, args ...interface{})
+	Infof(format string, args ...interface{})
+	Debugf(format string, args ...interface{})
+	Fatalf(format string, args ...interface{})
+}
+
 // TODO (OPTIONAL): ADD StopConfigUpdater
+// UPD: seems irrelevant as of december 2025
 
 type SecretManager interface {
 	UpdateSpecificSecret(path, varName string) (any, error)

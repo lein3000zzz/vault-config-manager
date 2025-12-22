@@ -35,7 +35,7 @@ var (
 type SecretManagerVault struct {
 	vaultClient *vaultapi.Client
 	config      config
-	logger      *zap.SugaredLogger
+	logger      logger
 	notifier    chan struct{}
 
 	basePath     string
@@ -98,7 +98,7 @@ func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) {
 				sm.logger.Fatalf("Error unsealing Vault with key: %v", err)
 			}
 			if !resp.Sealed {
-				sm.logger.Info("Vault unsealed successfully")
+				sm.logger.Infof("Vault unsealed successfully")
 				break
 			}
 		}
@@ -178,7 +178,7 @@ func (sm *SecretManagerVault) setConfig(cfg config) {
 	sm.Lock()
 	defer sm.Unlock()
 
-	sm.logger.Infow("setting new config")
+	sm.logger.Infof("setting new config")
 	sm.config = cfg
 }
 
@@ -298,7 +298,7 @@ func (sm *SecretManagerVault) applyUpdatesToConfig(configUpdates config) {
 	sm.Lock()
 	defer sm.Unlock()
 
-	sm.logger.Infow("applying updates to config", "configUpdates", configUpdates)
+	sm.logger.Infof("applying updates to config: %v", configUpdates)
 	for k, v := range configUpdates {
 		sm.config[k] = v
 	}
@@ -403,7 +403,7 @@ func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) {
 		freshConfig, err := sm.getFullConfigFromVault()
 
 		if err != nil || freshConfig == nil {
-			sm.logger.Errorw("getFullConfigFromVault failed in configUpdater or freshConfig is nil", "error", err, "freshConfig", freshConfig)
+			sm.logger.Errorf("getFullConfigFromVault failed in configUpdater or freshConfig is nil, err = %v, freshConfig = %v", err, freshConfig)
 			continue
 		}
 

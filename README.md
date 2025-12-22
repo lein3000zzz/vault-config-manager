@@ -1,1 +1,2 @@
-Small config manager used in one of my projects among several microservices. Currently relies on https://github.com/uber-go/zap, but it may be changed in the future
+Small config manager used in one of my projects among several microservices. <br>
+Currently relies on the logger interface defined in the `secret.go` file

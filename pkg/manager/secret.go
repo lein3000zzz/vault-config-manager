@@ -10,15 +10,20 @@ const (
 	DefaultConfigUpdateInterval = 5 * time.Minute
 )
 
+const (
+	// DefaultBasePathData - дефолтный путь до самих секретов в папке.
+	DefaultBasePathData = "kv/data/"
+
+	// DefaultBasePathMetaData - дефолтный путь до подпапок с секретами в папке.
+	DefaultBasePathMetaData = "kv/metadata/"
+)
+
 type logger interface {
 	Errorf(format string, args ...interface{})
 	Infof(format string, args ...interface{})
 	Debugf(format string, args ...interface{})
 	Fatalf(format string, args ...interface{})
 }
-
-// TODO (OPTIONAL): ADD StopConfigUpdater
-// UPD: seems irrelevant as of december 2025
 
 type SecretManager interface {
 	UpdateSpecificSecret(path, varName string) (any, error)
@@ -32,4 +37,5 @@ type SecretManager interface {
 	StartConfigUpdater(updateInterval time.Duration)
 	GetNotifierChannel() <-chan struct{}
 	UnsealVault(unsealKeys []string)
+	StopUpdater() error
 }

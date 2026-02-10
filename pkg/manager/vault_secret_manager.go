@@ -12,14 +12,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	// DefaultBasePathData - дефолтный путь до самих секретов в папке.
-	DefaultBasePathData = "kv/data/"
-
-	// DefaultBasePathMetaData - дефолтный путь до подпапок с секретами в папке.
-	DefaultBasePathMetaData = "kv/metadata/"
-)
-
 var (
 	// Проверки делать через errors.Is(errToCheck, errToCompareWith)
 
@@ -30,6 +22,7 @@ var (
 	ErrWhileConvertingToInt    = errors.New("error converting folderKeyValues to int")
 	ErrWhileConvertingToFloat  = errors.New("error converting folderKeyValues to float64")
 	ErrEmptyVaultResponse      = errors.New("empty vault response")
+	ErrAlreadyClosed           = errors.New("already closed")
 )
 
 type SecretManagerVault struct {
@@ -37,6 +30,7 @@ type SecretManagerVault struct {
 	config      config
 	logger      logger
 	notifier    chan struct{}
+	stopChan    chan struct{}
 
 	basePath     string
 	baseMetaPath string
@@ -77,7 +71,8 @@ func NewSecretManager(
 		vaultClient:  client,
 		config:       smConfig,
 		logger:       logger,
-		notifier:     make(chan struct{}),
+		notifier:     make(chan struct{}, 1),
+		stopChan:     make(chan struct{}),
 		RWMutex:      &sync.RWMutex{},
 		basePath:     basePath,
 		baseMetaPath: baseMetaPath,
@@ -394,53 +389,55 @@ func (sm *SecretManagerVault) getConfigCopy() config {
 }
 
 func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) {
+	defer close(sm.notifier)
+
 	ticker := time.NewTicker(updateInterval)
+	defer ticker.Stop()
+
 	configCopy := sm.getConfigCopy()
 
 	for {
-		<-ticker.C
+		select {
+		case <-sm.stopChan:
+			return
+		case <-ticker.C:
+			freshConfig, err := sm.getFullConfigFromVault()
 
-		freshConfig, err := sm.getFullConfigFromVault()
+			if err != nil || freshConfig == nil {
+				sm.logger.Errorf("getFullConfigFromVault failed in configUpdater or freshConfig is nil, err = %v, freshConfig = %v", err, freshConfig)
+				continue
+			}
 
-		if err != nil || freshConfig == nil {
-			sm.logger.Errorf("getFullConfigFromVault failed in configUpdater or freshConfig is nil, err = %v, freshConfig = %v", err, freshConfig)
-			continue
+			if !areConfigsDifferent(freshConfig, configCopy) {
+				continue
+			}
+
+			sm.setConfig(freshConfig)
+			configCopy = sm.getConfigCopy()
+
+			select {
+			case sm.notifier <- struct{}{}:
+			case <-sm.stopChan:
+				return
+			default:
+				sm.logger.Infof("configUpdater notifier blocked, cant send notification")
+			}
 		}
-
-		if !areConfigsDifferent(freshConfig, configCopy) {
-			continue
-		}
-
-		sm.setConfig(freshConfig)
-		configCopy = sm.getConfigCopy()
-
-		sm.notifier <- struct{}{}
 	}
 }
 
+// GetNotifierChannel may return nil if config updater is not started (I hope I will not forget it myself)
 func (sm *SecretManagerVault) GetNotifierChannel() <-chan struct{} {
 	return sm.notifier
 }
 
-// mergeConfigs - берет ключи из src и пишет в destination. Если в destination такое уже есть, то не пишет!
-func mergeConfigs(destination, src config) {
-	for k, v := range src {
-		if _, ok := destination[k]; !ok {
-			destination[k] = v
-		}
-	}
-}
-
-func areConfigsDifferent(config1, config2 config) bool {
-	if len(config1) != len(config2) {
-		return true
+func (sm *SecretManagerVault) StopUpdater() error {
+	select {
+	case <-sm.stopChan:
+		return ErrAlreadyClosed
+	default:
+		close(sm.stopChan)
 	}
 
-	for k, v1 := range config1 {
-		if v2, ok := config2[k]; !ok || !reflect.DeepEqual(v1, v2) {
-			return true
-		}
-	}
-
-	return false
+	return nil
 }

@@ -1,41 +1,35 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	vaultapi "github.com/hashicorp/vault/api"
-	"go.uber.org/zap"
 )
 
-var (
-	// Проверки делать через errors.Is(errToCheck, errToCompareWith)
-
-	ErrKeyNotFound             = errors.New("keyToLookup not found in the config")
-	ErrNotMapInterface         = errors.New("not map interface")
-	ErrWhileConvertingToString = errors.New("error converting folderKeyValues to string")
-	ErrWhileConvertingToBool   = errors.New("error converting folderKeyValues to bool")
-	ErrWhileConvertingToInt    = errors.New("error converting folderKeyValues to int")
-	ErrWhileConvertingToFloat  = errors.New("error converting folderKeyValues to float64")
-	ErrEmptyVaultResponse      = errors.New("empty vault response")
-	ErrAlreadyClosed           = errors.New("already closed")
-)
+var _ SecretManager = (*SecretManagerVault)(nil)
 
 type SecretManagerVault struct {
 	vaultClient *vaultapi.Client
 	config      config
-	logger      logger
+	logger      Logger
 	notifier    chan struct{}
 	stopChan    chan struct{}
 
 	basePath     string
 	baseMetaPath string
 
-	*sync.RWMutex
+	updaterStarted atomic.Bool
+	stopOnce       sync.Once
+
+	mu sync.RWMutex
 }
 
 func NewSecretManager(
@@ -43,7 +37,7 @@ func NewSecretManager(
 	token,
 	basePath string,
 	baseMetaPath string,
-	logger *zap.SugaredLogger,
+	logger Logger,
 ) (*SecretManagerVault, error) {
 	vaultConfig := vaultapi.DefaultConfig()
 	if vaultAddr != "" {
@@ -63,6 +57,10 @@ func NewSecretManager(
 		baseMetaPath += "/"
 	}
 
+	if logger == nil {
+		logger = NoopLogger()
+	}
+
 	client.SetToken(token)
 
 	smConfig := config(make(map[string]any))
@@ -73,116 +71,122 @@ func NewSecretManager(
 		logger:       logger,
 		notifier:     make(chan struct{}, 1),
 		stopChan:     make(chan struct{}),
-		RWMutex:      &sync.RWMutex{},
 		basePath:     basePath,
 		baseMetaPath: baseMetaPath,
 	}, nil
 }
 
-// UnsealVault пытается распечатать хранилище и ФАТАЛИТ, если у него не получается
-func (sm *SecretManagerVault) UnsealVault(unsealKeys []string) {
-	status, err := sm.vaultClient.Sys().SealStatus()
+func (sm *SecretManagerVault) UnsealVault(ctx context.Context, unsealKeys []string) error {
+	status, err := sm.vaultClient.Sys().SealStatusWithContext(ctx)
 	if err != nil {
-		sm.logger.Fatalf("Error getting seal status: %v", err)
+		sm.logger.Error(ctx, "getting seal status failed", keyError, err)
+		return err
+	}
+
+	if !status.Sealed {
+		return nil
+	}
+
+	var errToReturn error
+
+	for _, key := range unsealKeys {
+		resp, errUnseal := sm.vaultClient.Sys().UnsealWithContext(ctx, strings.TrimSpace(key))
+		if errUnseal != nil {
+			sm.logger.Error(ctx, "unsealing vault with key failed", keyError, errUnseal)
+			errToReturn = errors.Join(errToReturn, errUnseal)
+
+			continue
+		}
+
+		if !resp.Sealed {
+			sm.logger.Info(ctx, "vault unsealed successfully")
+
+			return nil
+		}
+	}
+
+	status, err = sm.vaultClient.Sys().SealStatusWithContext(ctx)
+	if err != nil {
+		sm.logger.Error(ctx, "getting seal status failed", keyError, err)
+
+		return errors.Join(errToReturn, err)
 	}
 
 	if status.Sealed {
-		for _, key := range unsealKeys {
-			resp, err := sm.vaultClient.Sys().Unseal(strings.TrimSpace(key))
-			if err != nil {
-				sm.logger.Fatalf("Error unsealing Vault with key: %v", err)
-			}
-			if !resp.Sealed {
-				sm.logger.Infof("Vault unsealed successfully")
-				break
-			}
-		}
+		sm.logger.Error(ctx, "failed to unseal vault", "keysTried", len(unsealKeys))
 
-		status, err = sm.vaultClient.Sys().SealStatus()
-		if err != nil || status.Sealed {
-			sm.logger.Fatalf("Failed to unseal Vault")
-		}
+		return errors.Join(errToReturn, ErrStillSealed)
 	}
+
+	return nil
 }
 
-// UpdateSpecificSecret обновляет секрет СРАЗУ В ТЕКУЩЕМ КОНФИГЕ и возвращает секрет. Начинаем без слэша, в конце - опционально,
-// поскольку мы обращаемся относительно базового пути, который находится в константах BaseDataPath и BaseMetaDataPath
-// пример - UpdateSpecificSecretString("test/", "test")
-func (sm *SecretManagerVault) UpdateSpecificSecret(folder, key string) (any, error) {
-	vaultResponse, err := sm.vaultClient.Logical().Read(sm.basePath + folder)
+func (sm *SecretManagerVault) UpdateSpecificSecret(ctx context.Context, folder, key string) (any, error) {
+	vaultResponse, err := sm.vaultClient.Logical().ReadWithContext(ctx, sm.basePath+folder)
 	if err != nil {
-		sm.logger.Errorf("Error reading secret at folder '%s': %s", folder, err.Error())
+		sm.logger.Error(ctx, "reading secret failed", "folder", folder, keyError, err)
 		return "", err
 	}
 
 	if vaultResponse == nil || vaultResponse.Data == nil {
-		sm.logger.Infof("Got nil while reading secret at folder '%s': keyToLookup %s", folder, key)
+		sm.logger.Debug(ctx, "got nil while reading secret", "folder", folder, "keyToLookup", key)
 		return "", ErrEmptyVaultResponse
 	}
 
 	secretData, okConversionToMapInterface := vaultResponse.Data["data"].(map[string]interface{})
 	if !okConversionToMapInterface {
-		sm.logger.Errorf("Error reading secret at folder '%s': failed to convert to map[string]interface{}", folder)
+		sm.logger.Error(ctx, "reading secret failed: not a map[string]interface{}", "folder", folder)
 		return "", ErrNotMapInterface
 	}
 
 	secretVal := secretData[key]
 
-	sm.putSingleSecretStringIntoTheConfig(key, secretVal)
+	sm.putSingleSecretStringIntoTheConfig(ctx, key, secretVal)
 
 	return secretVal, nil
 }
 
-// Добавить в конфиг по определенному ключу определенное значение
-func (sm *SecretManagerVault) putSingleSecretStringIntoTheConfig(key string, secretString any) {
-	sm.Lock()
-	defer sm.Unlock()
+func (sm *SecretManagerVault) putSingleSecretStringIntoTheConfig(ctx context.Context, key string, secretString any) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	sm.config[key] = secretString
-	sm.logger.Infof("Updated secret in the config with keyToLookup %s to data '%s'", key, secretString)
+	sm.logger.Debug(ctx, "updated secret in the config", "keyToLookup", key)
 }
 
-// UpdateConfig берет полный конфиг из vault'a, и обновления вносит в текущий
-func (sm *SecretManagerVault) UpdateConfig() error {
-	cfg, err := sm.getFullConfigFromVault()
+func (sm *SecretManagerVault) UpdateConfig(ctx context.Context) error {
+	cfg, err := sm.getFullConfigFromVault(ctx)
 	if err != nil {
-		sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+		sm.logger.Error(ctx, "getting config from vault failed", keyError, err)
 		return err
 	}
 
-	sm.applyUpdatesToConfig(cfg)
+	sm.applyUpdatesToConfig(ctx, cfg)
 
 	return nil
 }
 
-// ResetConfig берет полный конфиг из vault'a и старый конфиг заменяет на новый
-func (sm *SecretManagerVault) ResetConfig() error {
-	cfg, err := sm.getFullConfigFromVault()
+func (sm *SecretManagerVault) ResetConfig(ctx context.Context) error {
+	cfg, err := sm.getFullConfigFromVault(ctx)
 	if err != nil {
-		sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+		sm.logger.Error(ctx, "getting config from vault failed", keyError, err)
 		return err
 	}
 
-	sm.setConfig(cfg)
+	sm.setConfig(ctx, cfg)
 
 	return nil
 }
 
-// Сетит предоставленный конфиг
-func (sm *SecretManagerVault) setConfig(cfg config) {
-	sm.Lock()
-	defer sm.Unlock()
+func (sm *SecretManagerVault) setConfig(ctx context.Context, cfg config) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	sm.logger.Infof("setting new config")
+	sm.logger.Info(ctx, "setting new config", "keys", len(cfg))
 	sm.config = cfg
 }
 
-// getFullConfigFromVault целиком собирает конфиг, проходясь по каждой папке, и считывает секреты с помощью getConfigFromVaultByPath,
-// то есть сохраняются все те же правила - если в папке произошла ошибка, никакие данные из этой папки не будут обновлены.
-// СБОР ВСЕГО КОНФИГА НЕ БЛОКИРУЕТСЯ НИ НА КАКОЙ СТАДИИ, ТО ЕСТЬ У НАС ПРОВЕРЯТСЯ ВСЕ ПАПКИ, ДАЖЕ ЕСЛИ ВО ВРЕМЯ
-// ВЫПОЛНЕНИЯ БУДУТ ОШИБКИ. На выходе мы получаем СОВОКУПНУЮ ошибку, состоящую из нескольких ошибок.
-// Дальнейшие действия зависят от более высокой абстракции
-func (sm *SecretManagerVault) getFullConfigFromVault() (config, error) {
+func (sm *SecretManagerVault) getFullConfigFromVault(ctx context.Context) (config, error) {
 	folderStack := make([]string, 0, 4)
 	folderStack = append(folderStack, "") // мы смотрим на базовый путь
 
@@ -196,31 +200,41 @@ func (sm *SecretManagerVault) getFullConfigFromVault() (config, error) {
 		currCheckedPath := sm.baseMetaPath + currCheckedFolder
 		folderStack = folderStack[:len(folderStack)-1]
 
-		vaultResponseList, errList := sm.vaultClient.Logical().List(currCheckedPath)
+		vaultResponseList, errList := sm.vaultClient.Logical().ListWithContext(ctx, currCheckedPath)
 
 		if errList != nil {
-			sm.logger.Errorf("Error listing secrets folders at path '%s': %s", currCheckedPath, errList.Error())
+			sm.logger.Error(ctx, "listing secrets folders failed", "path", currCheckedPath, keyError, errList)
 			errToReturn = errors.Join(errToReturn, errList)
+
 			continue
 		}
 
 		if vaultResponseList == nil || vaultResponseList.Data == nil {
-			sm.logger.Infof("Got nil while listing secrets folders at path '%s'", currCheckedPath)
+			sm.logger.Debug(ctx, "got nil while listing secrets folders", "path", currCheckedPath)
+			continue
+		}
+
+		keys, okConversionToSlice := vaultResponseList.Data["keys"].([]interface{})
+		if !okConversionToSlice {
+			sm.logger.Error(ctx, "listing secrets folders failed: no keys list in response", "path", currCheckedPath)
+			errToReturn = errors.Join(errToReturn, ErrNoKeysList)
+
 			continue
 		}
 
 		var currInnerFolder string
-		for _, folder := range vaultResponseList.Data["keys"].([]interface{}) {
+		for _, folder := range keys {
 			folderString, okConversionToString := folder.(string)
 
 			if !okConversionToString {
-				sm.logger.Errorf("Error reading secret at folder '%s': failed to convert folder to string %s", folder, folderString)
+				sm.logger.Error(ctx, "reading secret failed: folder is not a string", "folder", folder)
 				errToReturn = errors.Join(errToReturn, ErrWhileConvertingToString)
+
 				continue
 			}
 
 			currInnerFolder = currCheckedFolder + folderString
-			folderConfigUpdates, err := sm.getConfigFromVaultByPath(currInnerFolder)
+			folderConfigUpdates, err := sm.getConfigFromVaultByPath(ctx, currInnerFolder)
 			if err != nil && !errors.Is(err, ErrEmptyVaultResponse) {
 				errToReturn = errors.Join(errToReturn, err)
 			}
@@ -234,29 +248,25 @@ func (sm *SecretManagerVault) getFullConfigFromVault() (config, error) {
 	return cumulativeConfig, errToReturn
 }
 
-// UpdateConfigByPath Собирает обновления по пути, а далее вносит обновления в текущий конфиг
-func (sm *SecretManagerVault) UpdateConfigByPath(path string) error {
-	cfg, err := sm.getConfigFromVaultByPath(path)
+func (sm *SecretManagerVault) UpdateConfigByPath(ctx context.Context, path string) error {
+	cfg, err := sm.getConfigFromVaultByPath(ctx, path)
 	if err != nil {
-		sm.logger.Errorf("Error getting config from Vault: %s", err.Error())
+		sm.logger.Error(ctx, "getting config from vault failed", "path", path, keyError, err)
 		return err
 	}
 
-	sm.applyUpdatesToConfig(cfg)
+	sm.applyUpdatesToConfig(ctx, cfg)
 
 	return nil
 }
 
-// getConfigFromVaultByPath собирает конфиг по пути, который укажем, относительно базового пути. Если во время обновления произошла
-// хотя бы одна ошибка, изменения останавливаются, и возвращается тот конфиг, который был на момент ошибки.
-// Оставил глобальной для юзкейсов, когда мы точно ничего не удалили, а лишь обновили старые или добавили новые
-func (sm *SecretManagerVault) getConfigFromVaultByPath(path string) (config, error) {
-	vaultResponse, err := sm.vaultClient.Logical().Read(sm.basePath + path)
+func (sm *SecretManagerVault) getConfigFromVaultByPath(ctx context.Context, path string) (config, error) {
+	vaultResponse, err := sm.vaultClient.Logical().ReadWithContext(ctx, sm.basePath+path)
 
 	freshConfigByPath := config(make(map[string]any))
 
 	if err != nil {
-		sm.logger.Errorf("Error reading secrets at path '%s': %s", path, err.Error())
+		sm.logger.Error(ctx, "reading secrets failed", "path", path, keyError, err)
 		return freshConfigByPath, err
 	}
 
@@ -266,47 +276,47 @@ func (sm *SecretManagerVault) getConfigFromVaultByPath(path string) (config, err
 
 	secretData, okConversionToMapInterface := vaultResponse.Data["data"].(map[string]interface{})
 	if !okConversionToMapInterface {
-		sm.logger.Errorf("Error reading secrets at path '%s': failed to convert to map[string]interface{}", path)
+		sm.logger.Error(ctx, "reading secrets failed: not a map[string]interface{}", "path", path)
 		return freshConfigByPath, ErrNotMapInterface
 	}
 
 	for k, v := range secretData {
 
-		switch v.(type) {
+		switch typed := v.(type) {
 		case json.Number:
-			freshConfigByPath[k], err = v.(json.Number).Float64()
+			freshConfigByPath[k], err = typed.Float64()
 
 			if err != nil {
-				sm.logger.Errorf("Error reading secret at path '%s': %s", path, err.Error())
+				sm.logger.Error(ctx, "reading secret failed", "path", path, keyError, err)
 				return freshConfigByPath, err
 			}
 		default:
 			freshConfigByPath[k] = v
-			sm.logger.Debugf("Reading secret, which is not json.Number at path '%s', type %v", path, reflect.TypeOf(v))
+			sm.logger.Debug(ctx, "reading secret which is not json.Number", "path", path, "type", reflect.TypeOf(v))
 		}
 	}
 
 	return freshConfigByPath, nil
 }
 
-func (sm *SecretManagerVault) applyUpdatesToConfig(configUpdates config) {
-	sm.Lock()
-	defer sm.Unlock()
+func (sm *SecretManagerVault) applyUpdatesToConfig(ctx context.Context, configUpdates config) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	sm.logger.Infof("applying updates to config: %v", configUpdates)
+	sm.logger.Debug(ctx, "applying updates to config", "keys", len(configUpdates))
 	for k, v := range configUpdates {
 		sm.config[k] = v
 	}
 }
 
-func (sm *SecretManagerVault) GetSecretStringFromConfig(key string) (string, error) {
-	sm.RLock()
-	defer sm.RUnlock()
+func (sm *SecretManagerVault) GetSecretStringFromConfig(ctx context.Context, key string) (string, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 	if value, exists := sm.config[key]; exists {
 		valueStr, ok := value.(string)
 
 		if !ok {
-			sm.logger.Errorf("Error reading secret at path '%s': failed to convert to string", key)
+			sm.logger.Error(ctx, "reading secret failed: not a string", "keyToLookup", key)
 			return "", ErrWhileConvertingToString
 		}
 
@@ -315,13 +325,13 @@ func (sm *SecretManagerVault) GetSecretStringFromConfig(key string) (string, err
 	return "", ErrKeyNotFound
 }
 
-func (sm *SecretManagerVault) GetSecretBoolFromConfig(key string) (bool, error) {
-	sm.RLock()
-	defer sm.RUnlock()
+func (sm *SecretManagerVault) GetSecretBoolFromConfig(ctx context.Context, key string) (bool, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 	if value, exists := sm.config[key]; exists {
 		boolVal, ok := value.(bool)
 		if !ok {
-			sm.logger.Errorf("Error reading secret at path '%s': failed to convert to bool", key)
+			sm.logger.Error(ctx, "reading secret failed: not a bool", "keyToLookup", key)
 			return false, ErrWhileConvertingToBool
 		}
 		return boolVal, nil
@@ -329,19 +339,19 @@ func (sm *SecretManagerVault) GetSecretBoolFromConfig(key string) (bool, error) 
 	return false, ErrKeyNotFound
 }
 
-func (sm *SecretManagerVault) GetSecretIntFromConfig(key string) (int, error) {
-	sm.RLock()
-	defer sm.RUnlock()
+func (sm *SecretManagerVault) GetSecretIntFromConfig(ctx context.Context, key string) (int, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 	if value, exists := sm.config[key]; exists {
 
 		var intVal int
-		switch value.(type) {
+		switch typed := value.(type) {
 		case float64:
-			intVal = int(value.(float64))
+			intVal = int(typed)
 		case int:
-			intVal = value.(int)
+			intVal = typed
 		default:
-			sm.logger.Errorf("Error reading secret for key %s from config: failed to convert to int", key)
+			sm.logger.Error(ctx, "reading secret failed: not an int", "keyToLookup", key)
 			return 0, ErrWhileConvertingToInt
 		}
 
@@ -350,13 +360,14 @@ func (sm *SecretManagerVault) GetSecretIntFromConfig(key string) (int, error) {
 	return 0, ErrKeyNotFound
 }
 
-func (sm *SecretManagerVault) GetSecretFloat64FromConfig(key string) (float64, error) {
-	sm.RLock()
-	defer sm.RUnlock()
+func (sm *SecretManagerVault) GetSecretFloat64FromConfig(ctx context.Context, key string) (float64, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	if value, exists := sm.config[key]; exists {
 		floatVal, ok := value.(float64)
 		if !ok {
-			sm.logger.Errorf("Error reading secret at path '%s': failed to convert to float64", key)
+			sm.logger.Error(ctx, "reading secret failed: not a float64", "keyToLookup", key)
 			return 0, ErrWhileConvertingToFloat
 		}
 		return floatVal, nil
@@ -364,31 +375,32 @@ func (sm *SecretManagerVault) GetSecretFloat64FromConfig(key string) (float64, e
 	return 0, ErrKeyNotFound
 }
 
-func (sm *SecretManagerVault) ReloadConfig() error {
+func (sm *SecretManagerVault) ReloadConfig(ctx context.Context) error {
 	sm.PurgeConfig()
-	return sm.ResetConfig()
+	return sm.ResetConfig(ctx)
 }
 
 func (sm *SecretManagerVault) PurgeConfig() {
-	sm.Lock()
-	defer sm.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	sm.config = make(map[string]any)
 }
 
 func (sm *SecretManagerVault) getConfigCopy() config {
-	sm.RLock()
-	defer sm.RUnlock()
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 
-	configCopy := config{}
-	for k, v := range sm.config {
-		configCopy[k] = v
-	}
-
-	return configCopy
+	return maps.Clone(sm.config)
 }
 
-func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) {
+func (sm *SecretManagerVault) StartConfigUpdater(ctx context.Context, updateInterval time.Duration) {
+	if !sm.updaterStarted.CompareAndSwap(false, true) {
+		sm.logger.Warn(ctx, "configUpdater already started")
+
+		return
+	}
+
 	defer close(sm.notifier)
 
 	ticker := time.NewTicker(updateInterval)
@@ -398,13 +410,19 @@ func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			sm.logger.Info(ctx, "configUpdater stopping", keyError, ctx.Err())
+
+			return
 		case <-sm.stopChan:
 			return
 		case <-ticker.C:
-			freshConfig, err := sm.getFullConfigFromVault()
+			freshConfig, err := sm.getFullConfigFromVault(ctx)
 
 			if err != nil || freshConfig == nil {
-				sm.logger.Errorf("getFullConfigFromVault failed in configUpdater or freshConfig is nil, err = %v, freshConfig = %v", err, freshConfig)
+				sm.logger.Error(ctx, "getFullConfigFromVault failed in configUpdater or freshConfig is nil",
+					keyError, err, "freshConfigIsNil", freshConfig == nil)
+
 				continue
 			}
 
@@ -412,32 +430,33 @@ func (sm *SecretManagerVault) StartConfigUpdater(updateInterval time.Duration) {
 				continue
 			}
 
-			sm.setConfig(freshConfig)
+			sm.setConfig(ctx, freshConfig)
 			configCopy = sm.getConfigCopy()
 
 			select {
 			case sm.notifier <- struct{}{}:
+			case <-ctx.Done():
+				return
 			case <-sm.stopChan:
 				return
 			default:
-				sm.logger.Infof("configUpdater notifier blocked, cant send notification")
+				sm.logger.Warn(ctx, "configUpdater notifier blocked, cant send notification")
 			}
 		}
 	}
 }
 
-// GetNotifierChannel may return nil if config updater is not started (I hope I will not forget it myself)
 func (sm *SecretManagerVault) GetNotifierChannel() <-chan struct{} {
 	return sm.notifier
 }
 
 func (sm *SecretManagerVault) StopUpdater() error {
-	select {
-	case <-sm.stopChan:
-		return ErrAlreadyClosed
-	default:
-		close(sm.stopChan)
-	}
+	err := ErrAlreadyClosed
 
-	return nil
+	sm.stopOnce.Do(func() {
+		close(sm.stopChan)
+		err = nil
+	})
+
+	return err
 }

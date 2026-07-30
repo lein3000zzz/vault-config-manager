@@ -1,8 +1,10 @@
 package manager
 
-import "reflect"
+import (
+	"maps"
+	"reflect"
+)
 
-// mergeConfigs - берет ключи из src и пишет в destination. Если в destination такое уже есть, то не пишет!
 func mergeConfigs(destination, src config) {
 	for k, v := range src {
 		if _, ok := destination[k]; !ok {
@@ -12,15 +14,7 @@ func mergeConfigs(destination, src config) {
 }
 
 func areConfigsDifferent(config1, config2 config) bool {
-	if len(config1) != len(config2) {
-		return true
-	}
-
-	for k, v1 := range config1 {
-		if v2, ok := config2[k]; !ok || !reflect.DeepEqual(v1, v2) {
-			return true
-		}
-	}
-
-	return false
+	return !maps.EqualFunc(config1, config2, func(v1, v2 any) bool {
+		return reflect.DeepEqual(v1, v2)
+	})
 }

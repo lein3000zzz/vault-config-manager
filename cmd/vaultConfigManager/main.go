@@ -1,31 +1,47 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/lein3000zzz/the-watchers/pkg/observability/logging"
+	"github.com/lein3000zzz/the-watchers/pkg/observability/logging/slogging"
 	"github.com/lein3000zzz/vault-config-manager/pkg/manager"
-	"go.uber.org/zap"
 )
 
 func main() {
-	logger := initLogger()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	sm, err := manager.NewSecretManager(os.Getenv("VAULT_ADDRESS"), os.Getenv("VAULT_TOKEN"), manager.DefaultBasePathData, manager.DefaultBasePathMetaData, logger)
+	logger, err := slogging.NewSlogLoggerWithConfig(slogging.Config{
+		Level:    logging.LevelInfo,
+		Format:   logging.FormatJSON,
+		ToStdout: true,
+	})
 	if err != nil {
-		logger.Fatal("Error creating secret manager", zap.Error(err))
+		log.Fatalf("Error initializing logger: %v", err)
+	}
+	defer func() {
+		if errClose := logger.Close(); errClose != nil {
+			log.Printf("Error closing logger: %v", errClose)
+		}
+	}()
+
+	sm, err := manager.NewSecretManager(
+		os.Getenv("VAULT_ADDRESS"),
+		os.Getenv("VAULT_TOKEN"),
+		manager.DefaultBasePathData,
+		manager.DefaultBasePathMetaData,
+		logger,
+	)
+	if err != nil {
+		logger.Error(ctx, "creating secret manager failed", logging.KeyError, err)
+
+		return
 	}
 
-	sm.StartConfigUpdater(manager.DefaultConfigUpdateInterval)
-}
-
-func initLogger() *zap.SugaredLogger {
-	zapLogger, err := zap.NewProduction()
-	if err != nil {
-		log.Fatalf("Error initializing zap logger: %v", err)
-		return nil
-	}
-
-	logger := zapLogger.Sugar()
-	return logger
+	sm.StartConfigUpdater(ctx, manager.DefaultConfigUpdateInterval)
 }

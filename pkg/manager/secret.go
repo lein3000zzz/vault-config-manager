@@ -1,41 +1,41 @@
 package manager
 
 import (
+	"context"
 	"time"
 )
 
-type config map[string]any
-
-const (
-	DefaultConfigUpdateInterval = 5 * time.Minute
-)
-
-const (
-	// DefaultBasePathData - дефолтный путь до самих секретов в папке.
-	DefaultBasePathData = "kv/data/"
-
-	// DefaultBasePathMetaData - дефолтный путь до подпапок с секретами в папке.
-	DefaultBasePathMetaData = "kv/metadata/"
-)
-
-type logger interface {
-	Errorf(format string, args ...interface{})
-	Infof(format string, args ...interface{})
-	Debugf(format string, args ...interface{})
-	Fatalf(format string, args ...interface{})
-}
-
 type SecretManager interface {
-	UpdateSpecificSecret(path, varName string) (any, error)
-	ResetConfig() error
-	ReloadConfig() error
-	UpdateConfigByPath(path string) error
-	GetSecretStringFromConfig(key string) (string, error)
-	GetSecretBoolFromConfig(key string) (bool, error)
-	GetSecretIntFromConfig(key string) (int, error)
-	GetSecretFloat64FromConfig(key string) (float64, error)
-	StartConfigUpdater(updateInterval time.Duration)
+	UpdateSpecificSecret(ctx context.Context, path, varName string) (any, error)
+	UpdateConfig(ctx context.Context) error
+	ResetConfig(ctx context.Context) error
+	ReloadConfig(ctx context.Context) error
+	PurgeConfig()
+	UpdateConfigByPath(ctx context.Context, path string) error
+	GetSecretStringFromConfig(ctx context.Context, key string) (string, error)
+	GetSecretBoolFromConfig(ctx context.Context, key string) (bool, error)
+	GetSecretIntFromConfig(ctx context.Context, key string) (int, error)
+	GetSecretFloat64FromConfig(ctx context.Context, key string) (float64, error)
+	StartConfigUpdater(ctx context.Context, updateInterval time.Duration)
 	GetNotifierChannel() <-chan struct{}
-	UnsealVault(unsealKeys []string)
+	UnsealVault(ctx context.Context, unsealKeys []string) error
 	StopUpdater() error
 }
+
+type Logger interface {
+	Debug(ctx context.Context, msg string, args ...any)
+	Info(ctx context.Context, msg string, args ...any)
+	Warn(ctx context.Context, msg string, args ...any)
+	Error(ctx context.Context, msg string, args ...any)
+}
+
+func NoopLogger() Logger {
+	return noopLogger{}
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Debug(context.Context, string, ...any) {}
+func (noopLogger) Info(context.Context, string, ...any)  {}
+func (noopLogger) Warn(context.Context, string, ...any)  {}
+func (noopLogger) Error(context.Context, string, ...any) {}

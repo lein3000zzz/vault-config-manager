@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/vault"
-	"go.uber.org/zap"
 )
 
 const (
@@ -19,7 +18,7 @@ const (
 )
 
 var (
-	nilLogger = zap.NewNop().Sugar()
+	nilLogger = NoopLogger()
 )
 
 var newManagerTests = []struct {
@@ -159,8 +158,8 @@ func TestIntegrityWithVaultContainer(t *testing.T) {
 				})
 			require.NoError(t, writeErr)
 
-			_, err = sm.UpdateSpecificSecret(test.secretFolder, test.key)
-			retrievedString, err = sm.GetSecretStringFromConfig(test.key)
+			_, err = sm.UpdateSpecificSecret(ctx, test.secretFolder, test.key)
+			retrievedString, err = sm.GetSecretStringFromConfig(ctx, test.key)
 			assert.Equal(t, test.expectedErr, err)
 			assert.Equal(t, test.value, retrievedString)
 			assert.Equal(t, sm.config[test.key], retrievedString)
@@ -179,7 +178,7 @@ func TestIntegrityWithVaultContainer(t *testing.T) {
 				})
 			require.NoError(t, writeErr)
 
-			err = sm.UpdateConfigByPath(test.secretFolder)
+			err = sm.UpdateConfigByPath(ctx, test.secretFolder)
 			assert.Equal(t, test.expectedErr, err)
 
 			for k, v := range test.keyValues {
@@ -204,7 +203,7 @@ func TestIntegrityWithVaultContainer(t *testing.T) {
 				require.NoError(t, writeErr)
 			}
 
-			err = sm.ReloadConfig()
+			err = sm.ReloadConfig(ctx)
 			assert.Equal(t, test.expectedErr, err)
 			assert.Equal(t, test.expectedOutput, sm.config)
 
@@ -231,10 +230,12 @@ var putSingleSecretStringTests = []struct {
 }
 
 func TestPutSecretString(t *testing.T) {
+	ctx := context.Background()
+
 	sm, _ := NewSecretManager("", testVaultToken, testBasePathData, testBasePathMetadata, nilLogger)
 
 	for _, test := range putSingleSecretStringTests {
-		sm.putSingleSecretStringIntoTheConfig(test.key, test.value)
+		sm.putSingleSecretStringIntoTheConfig(ctx, test.key, test.value)
 		assert.Equal(t, test.value, sm.config[test.key])
 	}
 }
@@ -257,10 +258,12 @@ var applyUpdatesToConfigTests = []struct {
 }
 
 func TestApplyUpdatesToConfigAndPurge(t *testing.T) {
+	ctx := context.Background()
+
 	sm, _ := NewSecretManager("", testVaultToken, testBasePathData, testBasePathMetadata, nilLogger)
 
 	for _, test := range applyUpdatesToConfigTests {
-		sm.applyUpdatesToConfig(test.configUpdates)
+		sm.applyUpdatesToConfig(ctx, test.configUpdates)
 		assert.Equal(t, test.configUpdates, sm.config)
 		sm.PurgeConfig()
 		assert.Equal(t, config{}, sm.config)
@@ -312,6 +315,8 @@ var getSecretValuesTests = []struct {
 }
 
 func TestGetFromConfig(t *testing.T) {
+	ctx := context.Background()
+
 	sm, _ := NewSecretManager("", testVaultToken, testBasePathData, testBasePathMetadata, nilLogger)
 
 	for _, test := range getSecretValuesTests {
@@ -319,13 +324,13 @@ func TestGetFromConfig(t *testing.T) {
 			sm.config = test.keyValues
 			switch test.testCase {
 			case 0:
-				val, err := sm.GetSecretStringFromConfig(test.keyToLookup)
+				val, err := sm.GetSecretStringFromConfig(ctx, test.keyToLookup)
 				assert.True(t, errors.Is(err, test.expectedErr))
 				if test.expectedErr == nil {
 					assert.Equal(t, test.keyValues[test.keyToLookup], val)
 				}
 			case 1:
-				val, err := sm.GetSecretBoolFromConfig(test.keyToLookup)
+				val, err := sm.GetSecretBoolFromConfig(ctx, test.keyToLookup)
 				assert.True(t, errors.Is(err, test.expectedErr))
 				if test.expectedErr == nil {
 					booleanFromConfig, _ := sm.config[test.keyToLookup].(bool)
